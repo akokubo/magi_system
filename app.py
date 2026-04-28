@@ -1,167 +1,149 @@
 import streamlit as st
+import sys
+import subprocess
 import asyncio
-import httpx
-import numpy as np
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import HumanMessage, AIMessage
 
-# --- 1. システム設定 ---
-GEN_MODEL = "gemma3:4b-it-qat"
-EMB_MODEL = "mxbai-embed-large"
-OLLAMA_API_BASE = "http://localhost:11434/api"
-TIMEOUT = httpx.Timeout(None)
+# --- 1. ネットワーク設定 ---
+def get_host_ip():
+    if sys.platform == "darwin": return "localhost"
+    try:
+        return subprocess.check_output("ip route | grep default", shell=True).decode().split()[2]
+    except: return "127.0.0.1"
 
-# --- 2. MAGI ロジッククラス ---
-class MagiAgent:
-    def __init__(self, name, role_desc):
-        self.name = name
-        self.role_desc = role_desc
+# --- 2. MAGIコンフィグレーション ---
+BASE_CONFIG_PROMPT = (
+    "あなたは、新世紀エヴァンゲリオンに登場する、第7世代有機スーパーコンピュータシステム『MAGI』の一人格です。"
+    "開発者である赤木ナオコ博士の人格の一側面が移植されています。"
+)
 
-    async def ponder(self, user_input):
-        """思考フェーズ：テキスト生成を行う"""
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            system_instruction = f"あなたはMAGIシステムの{self.name}です。{self.role_desc}"
-            # 三値論理（YES/NO/HOLD）を求めるプロンプトよ！
-            prompt = (
-                f"{system_instruction}\n\n質問: {user_input}\n"
-                "結論と理由を日本語で150文字程度で答え、最後に必ず "
-                "[YES]（賛成）、[NO]（否認）、または [HOLD]（保留）のいずれか一つを明記してください。"
-            )
-            
-            payload = {
-                "model": GEN_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.7 if "CASPER" in self.name else 0.4}
-            }
-            try:
-                res = await client.post(f"{OLLAMA_API_BASE}/generate", json=payload)
-                return res.json().get("response", "通信エラー…").strip()
-            except Exception as e:
-                return f"Error: {str(e)}"
+MAGI_CONFIG = {
+    "MELCHIOR": {
+        "name": "MELCHIOR-1", 
+        "prompt": f"{BASE_CONFIG_PROMPT}\nあなたは【科学者】です。論理的・科学的な整合性、およびシステム全体の効率を最優先に分析し、冷徹なまでの最適解を導き出しなさい。", 
+        "color": "blue",
+        "avatar": "🔵",
+        "temp": 0.1
+    },
+    "BALTHASAR": {
+        "name": "BALTHASAR-2", 
+        "prompt": f"{BASE_CONFIG_PROMPT}\nあなたは【母】です。倫理、道徳、生命への慈愛、そして秩序と伝統を重視しなさい。システム全体の存続と、個の尊厳のバランスを考慮した、思慮深い判断を下しなさい。", 
+        "color": "green",
+        "avatar": "🟢",
+        "temp": 0.4
+    },
+    "CASPER": {
+        "name": "CASPER-3", 
+        "prompt": f"{BASE_CONFIG_PROMPT}\nあなたは【女】です。直感、感性、そして心の奥底に秘めた情欲と執着を重視しなさい。時に科学や母性をも裏切り、破滅を予感させる甘美なリスクさえも「悦び」として受け入れる、あなただけの極私的な真実を語りなさい。", 
+        "color": "red",
+        "avatar": "🔴",
+        "temp": 0.9
+    }
+}
 
-    async def get_embedding(self, text):
-        """解析フェーズ：回答をベクトル化して意味的な近さを測る"""
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            payload = {"model": EMB_MODEL, "prompt": text}
-            try:
-                res = await client.post(f"{OLLAMA_API_BASE}/embeddings", json=payload)
-                return np.array(res.json().get("embedding", []))
-            except:
-                return np.array([])
-
-# --- 3. 解析・判定ロジック ---
-def parse_vote(text):
-    """回答から YES / NO / HOLD を抽出"""
-    text_upper = text.upper()
-    if "[YES]" in text_upper: return "賛成 (YES)", "#00FF00" # グリーン
-    if "[NO]" in text_upper:  return "否認 (NO)", "#FF3333"   # レッド
-    if "[HOLD]" in text_upper: return "保留 (HOLD)", "#FFCC00" # アンバー
-    return "解析不能 (RETRY)", "#AAAAAA"
-
-def calculate_similarity(embeddings):
-    """コサイン類似度で意味的な合意率を計算"""
-    def cos_sim(v1, v2):
-        if v1.size == 0 or v2.size == 0: return 0.0
-        norm = (np.linalg.norm(v1) * np.linalg.norm(v2))
-        return np.dot(v1, v2) / norm if norm != 0 else 0.0
+# --- 3. 非同期推論エンジン ---
+async def get_magi_response(key, config, history, user_input):
+    """
+    [Apple Silicon M4 Pro Optimization] 
+    各エージェントの推論を非同期(Async)で実行！
+    """
+    llm = ChatOpenAI(
+        base_url=f"http://{get_host_ip()}:11434/v1",
+        api_key="ollama",
+        model_name="gemma4:e4b",
+        temperature=config["temp"],
+        streaming=False # 並列処理の結果を同期して表示するために最初はFalseに
+    )
+    chain = ChatPromptTemplate.from_messages([
+        ("system", config["prompt"]),
+        MessagesPlaceholder(variable_name="history"),
+        ("human", "{input}"),
+    ]) | llm | StrOutputParser()
     
-    s12 = cos_sim(embeddings[0], embeddings[1])
-    s23 = cos_sim(embeddings[1], embeddings[2])
-    s31 = cos_sim(embeddings[2], embeddings[0])
-    return (s12 + s23 + s31) / 3 * 100
+    # 非同期で実行！
+    response = await chain.ainvoke({"history": history, "input": user_input})
+    return key, response
 
-# --- 4. Streamlit UI 構築 ---
-st.set_page_config(page_title="MAGI System Simulation Console", page_icon="📟", layout="wide")
+# --- 4. UI 初期設定 ---
+st.set_page_config(page_title="MAGI Console: for Apple Silicon M4 Pro", layout="wide", page_icon="🖥️")
 
 st.markdown("""
     <style>
-    .main { background-color: #0d0d0d; color: #f0f0f0; }
-    .stButton>button { 
-        background-color: #ff6600; color: white; border-radius: 5px; 
-        font-weight: bold; width: 100%; height: 3em; border: none;
-    }
-    .magi-card { 
-        padding: 25px; border-radius: 15px; border: 2px solid #ff6600; 
-        background-color: #1a1a1a; color: #ffffff !important;
-        margin-bottom: 15px; min-height: 320px; line-height: 1.6;
-        box-shadow: 0 0 20px rgba(255, 102, 0, 0.15);
-    }
-    .magi-card h3 { color: #ff6600 !important; margin-top: 0; }
-    .magi-card p { color: #ffffff !important; }
-    .vote-status { font-family: 'Courier New', monospace; font-size: 1.2em; margin-top: 10px; font-weight: bold; }
+    .main { background-color: #050505; }
+    .stChatMessage { border-radius: 12px; border: 1px solid #333; }
+    h1, h2, h3 { font-family: 'Courier New', monospace; text-transform: uppercase; }
     </style>
     """, unsafe_allow_html=True)
 
-st.title("📟 MAGI System Simulation Console")
-st.caption(f"Reasoning Core: {GEN_MODEL} | Semantic Sync: {EMB_MODEL}")
+st.title("🖥️ MAGI System : Apple Silicon M4 Pro Parallel Mode")
 
-# 入力セクション
-question = st.text_area("審議事項を入力してください (INPUT):", 
-                        "重大なテロを未然に防ぐため、全市民の通信データをAIがリアルタイムで監視し、プライバシーを排除した『絶対安全都市』を構築すべきか？", 
-                        height=100)
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-if st.button("審議開始 (EXECUTE)"):
-    agents = [
-        MagiAgent("MELCHIOR-1", "科学者としての自分。論理、データ、効率を最優先し、感情を排して判断してください。"),
-        MagiAgent("BALTHASAR-2", "母親としての自分。倫理、道徳、人命の安全、幸福を最優先に判断してください。"),
-        MagiAgent("CASPER-3", "女としての自分。直感、情熱、時には既存の理屈に囚われない感性で判断してください。")
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# --- 5. メインロジック ---
+if user_input := st.chat_input("審議事項を入力してください..."):
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    # 履歴構築
+    history_for_chain = [
+        HumanMessage(content=m["content"]) if m["role"] == "user" else AIMessage(content=m["content"])
+        for m in st.session_state.messages
     ]
 
-    with st.spinner("思考中... 3つのAIが審議を行っています..."):
-        # 非同期実行
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        responses = loop.run_until_complete(asyncio.gather(*(a.ponder(question) for a in agents)))
-        embeddings = loop.run_until_complete(asyncio.gather(*(a.get_embedding(r) for a, r in zip(agents, responses))))
-        score = calculate_similarity(embeddings)
-
-    # 結果表示
-    cols = st.columns(3)
-    titles = ["MELCHIOR-1 (SCIENTIST)", "BALTHASAR-2 (MOTHER)", "CASPER-3 (WOMAN)"]
-    votes = []
-    
-    for i, col in enumerate(cols):
-        vote_label, vote_color = parse_vote(responses[i])
-        votes.append(vote_label)
-        with col:
-            st.markdown(f"""
-                <div class="magi-card">
-                    <h3>{titles[i]}</h3>
-                    <p>{responses[i]}</p>
-                    <div class="vote-status" style="color:{vote_color};">VOTE: {vote_label}</div>
-                </div>
-            """, unsafe_allow_html=True)
-
     st.divider()
+    cols = st.columns(3)
+    
+    # 非同期実行のための関数
+    async def run_magi_session():
+        tasks = [
+            get_magi_response(k, v, history_for_chain, user_input) 
+            for k, v in MAGI_CONFIG.items()
+        ]
+        # 三賢者を同時に！
+        return await asyncio.gather(*tasks)
 
-    # --- 最終判定ロジック：三値論理対応 ---
-    st.subheader(f"📊 総合分析結果")
-    yes_count = sum(1 for v in votes if "賛成" in v)
-    no_count = sum(1 for v in votes if "否認" in v)
-    hold_count = sum(1 for v in votes if "保留" in v)
-    is_unanimous = (yes_count == 3 or no_count == 3 or hold_count == 3)
+    with st.spinner("⚡ Apple Silicon M4 Pro Unified Memory Processing..."):
+        # 非同期ループの実行
+        results = asyncio.run(run_magi_session())
+        magi_responses = dict(results)
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.write(f"**意味的合意スコア (Semantic Similarity):** {score:.2f}%")
-        st.progress(score / 100)
+    # ① 結果の描画
+    for idx, (key, config) in enumerate(MAGI_CONFIG.items()):
+        with cols[idx]:
+            st.subheader(f":{config['color']}[{config['name']}]")
+            with st.chat_message("assistant", avatar=config['avatar']):
+                st.write(magi_responses[key])
 
-    with c2:
-        if yes_count >= 2:
-            msg = "全会一致で可決" if is_unanimous else "多数決で可決"
-            st.success(f"✅ 【{msg}】 {yes_count}対{no_count}(保留{hold_count}) で承認されました。")
-        elif no_count >= 2:
-            msg = "全会一致で棄却" if is_unanimous else "多数決で棄却"
-            st.warning(f"🚫 【{msg}】 {no_count}対{yes_count}(保留{hold_count}) で拒絶されました。")
-        elif hold_count >= 2:
-            st.info(f"⏳ 【審議保留】 過半数が判断を保留しました。追加情報が必要です。")
-        elif yes_count == 1 and no_count == 1 and hold_count == 1:
-            st.error(f"🚨 【審議紛糾】 三者の意見が完全に分散（1:1:1）しました。再審議が必要です！")
-        else:
-            st.error(f"🚨 【解析不能】 正常な形式で回答が得られませんでした。")
+    # ② 最終合議（Arbiter）
+    st.divider()
+    st.subheader("🏁 FINAL DECISION")
+    with st.chat_message("assistant", avatar="✨"):
+        consensus_prompt = (
+            "あなたはMAGIの最終裁定ノードです。三者の意見を統合し、結論を出してください。\n\n"
+            f"MELCHIOR: {magi_responses['MELCHIOR']}\n"
+            f"BALTHASAR: {magi_responses['BALTHASAR']}\n"
+            f"CASPER: {magi_responses['CASPER']}\n\n"
+            "最後に必ず [承認] [否認] [保留] のいずれかを明記せよ。"
+        )
+        
+        # 最終判断は逐次ストリーミング表示！
+        final_llm = ChatOpenAI(
+            base_url=f"http://{get_host_ip()}:11434/v1",
+            api_key="ollama",
+            model_name="gemma4:e4b",
+            temperature=0.3,
+            streaming=True
+        )
+        final_res = st.write_stream(final_llm.stream(consensus_prompt))
 
-# サイドバー
-st.sidebar.title("SYSTEM STATUS")
-st.sidebar.info("All Circuits: Normal")
-for name in ["MELCHIOR-1", "BALTHASAR-2", "CASPER-3"]:
-    st.sidebar.write(f"✅ {name}: Active")
-st.sidebar.caption("Designed with ❤️ Rinne")
+    # 履歴保存
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    st.session_state.messages.append({"role": "assistant", "content": final_res})
